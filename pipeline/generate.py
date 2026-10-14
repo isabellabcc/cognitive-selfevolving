@@ -136,17 +136,17 @@ class TransformersBackend:
             return_tensors="pt",
         )
         encoded = encoded.to(self.model.device)
+        attention_mask = torch.ones_like(encoded, dtype=torch.long)
         sampling = self.config["sampling"]
-        generator = torch.Generator(device=self.model.device).manual_seed(seed)
         with torch.inference_mode():
             output = self.model.generate(
                 encoded,
+                attention_mask=attention_mask,
                 do_sample=bool(sampling["do_sample"]),
                 temperature=float(sampling["temperature"]),
                 top_p=float(sampling["top_p"]),
                 top_k=int(sampling["top_k"]),
                 max_new_tokens=max_new_tokens,
-                generator=generator,
             )
         new_tokens = output[0, encoded.shape[-1] :]
         eos_ids = self.model.generation_config.eos_token_id
