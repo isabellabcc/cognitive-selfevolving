@@ -1,0 +1,9 @@
+{"problem_id":"p1","sample_index":0,"raw_completion":"<think>method A</think>\\boxed{1}","finish_reason":"eos"}
+{"problem_id":"p1","sample_index":1,"raw_completion":"<think>method B with another route</think>\\boxed{1}","finish_reason":"eos"}
+{"problem_id":"p1","sample_index":2,"raw_completion":"<think>mistake</think>\\boxed{2}","finish_reason":"eos"}
+{"problem_id":"p2","sample_index":0,"raw_completion":"<think>only correct route</think>\\boxed{1}","finish_reason":"eos"}
+{"problem_id":"p2","sample_index":1,"raw_completion":"<think>mistake</think>\\boxed{3}","finish_reason":"eos"}
+{"problem_id":"p2","sample_index":2,"raw_completion":"<think>mistake again</think>\\boxed{4}","finish_reason":"eos"}
+{"problem_id":"p3","sample_index":0,"raw_completion":"<think>truncated","finish_reason":"length"}
+{"problem_id":"p3","sample_index":1,"raw_completion":"","finish_reason":"eos"}
+{"problem_id":"p3","sample_index":2,"raw_completion":"<think>bad final</think>not parseable","finish_reason":"eos"}

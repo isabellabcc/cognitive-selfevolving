@@ -1,0 +1,11 @@
+torch
+transformers>=4.51.0
+datasets
+accelerate
+safetensors
+PyYAML
+tqdm
+pandas
+math-verify
+sympy
+pytest

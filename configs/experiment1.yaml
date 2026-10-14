@@ -1,0 +1,55 @@
+project: cognitive_self_evolution
+run_id: math_qwen3_17b_v1
+master_seed: 20261012
+
+dataset:
+  repo_id: EleutherAI/hendrycks_math
+  split: train
+  configs:
+    - algebra
+    - counting_and_probability
+    - geometry
+    - intermediate_algebra
+    - number_theory
+    - prealgebra
+    - precalculus
+  subset_sizes:
+    seed_train: 2500
+    anchor: 300
+    dev: 200
+  target_level_ratios: {1: 0.20, 2: 0.30, 3: 0.30, 4: 0.15, 5: 0.05}
+  exclude_asymptote: true
+  split_seed: 42
+
+model:
+  id: Qwen/Qwen3-1.7B
+  revision: main
+  enable_thinking: true
+  device: auto
+  torch_dtype: auto
+
+sampling:
+  system_prompt: null
+  prompt_version: math_cot_v1
+  n_per_problem: 6
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  do_sample: true
+  max_new_tokens: 2048
+  batch_size: 1
+
+pilot:
+  source_subset: dev
+  n_problems: 100
+
+pool:
+  min_distinct_correct: 2
+  target_n_problems: 600
+  near_duplicate_jaccard_threshold: 0.90
+  dedup_token_ngram: 5
+  pool_seed: 20261012
+
+paths:
+  root: data/experiment1
+  run_root: runs/math_qwen3_17b_v1
