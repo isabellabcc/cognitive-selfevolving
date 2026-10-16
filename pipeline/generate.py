@@ -186,6 +186,90 @@ def paths_for_subset(config: Mapping[str, Any], subset: str) -> tuple[Path, Path
     return root / "splits" / f"{subset}.jsonl", root / "trajectories" / f"{subset}_raw.jsonl"
 
 
+def select_pilot_questions(
+    questions: list[dict[str, Any]], pilot_config: Mapping[str, Any], master_seed: int
+) -> list[dict[str, Any]]:
+    """Select a reproducible pilot sample without modifying any dataset split."""
+    count = int(pilot_config["n_problems"])
+    if count > len(questions):
+        raise PipelineError(
+            f"Pilot requests {count} problems, but its source split contains only {len(questions)}"
+        )
+
+    strategy = str(pilot_config.get("selection_strategy", "id_order"))
+    seed = int(pilot_config.get("selection_seed", master_seed))
+    ordered = sorted(questions, key=lambda row: str(row["problem_id"]))
+
+    if strategy == "level_counts":
+        configured_counts = {
+            int(level): int(value)
+            for level, value in pilot_config["level_counts"].items()
+        }
+        if set(configured_counts) != {1, 2, 3, 4, 5}:
+            raise PipelineError("Pilot level_counts must define every level from 1 through 5")
+        if any(value < 0 for value in configured_counts.values()):
+            raise PipelineError("Pilot level_counts values must be non-negative")
+        if sum(configured_counts.values()) != count:
+            raise PipelineError("Pilot level_counts values must sum to n_problems")
+        by_level: dict[int, list[dict[str, Any]]] = {level: [] for level in range(1, 6)}
+        for question in ordered:
+            try:
+                level = int(question["level"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PipelineError(
+                    "Pilot level_counts selection requires integer question levels"
+                ) from exc
+            if level not in by_level:
+                raise PipelineError(f"Pilot source contains an unsupported level: {level}")
+            by_level[level].append(question)
+
+        shortages = {
+            level: {"requested": configured_counts[level], "available": len(by_level[level])}
+            for level in range(1, 6)
+            if configured_counts[level] > len(by_level[level])
+        }
+        if shortages:
+            raise PipelineError(
+                "Pilot level_counts exceed the source split capacity: "
+                f"{canonical_json(shortages)}"
+            )
+
+        selected: list[dict[str, Any]] = []
+        for level in range(1, 6):
+            candidates = by_level[level]
+            random.Random(stable_seed(seed, "pilot_level", level)).shuffle(candidates)
+            selected.extend(candidates[: configured_counts[level]])
+        random.Random(stable_seed(seed, "pilot_selected_order")).shuffle(selected)
+        return selected
+    if strategy == "random":
+        random.Random(seed).shuffle(ordered)
+    elif strategy == "hardest":
+        # Randomize ties reproducibly, then use Python's stable sort to put the
+        # highest MATH levels first.
+        random.Random(seed).shuffle(ordered)
+        try:
+            ordered.sort(key=lambda row: int(row["level"]), reverse=True)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PipelineError("Pilot hardest selection requires integer question levels") from exc
+    elif strategy != "id_order":
+        raise PipelineError(f"Unsupported pilot.selection_strategy: {strategy}")
+
+    return ordered[:count]
+
+
+def pilot_selection_rows(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the numbered, public metadata for the selected pilot questions."""
+    return [
+        {
+            "question_index": question_index,
+            "problem_id": question["problem_id"],
+            "level": int(question["level"]),
+            "topic": question.get("topic"),
+        }
+        for question_index, question in enumerate(questions, start=1)
+    ]
+
+
 def _repair_incomplete_last_line(path: Path, event_writer) -> None:
     if not path.exists() or path.stat().st_size == 0:
         return
@@ -226,7 +310,10 @@ def _load_completed(path: Path, expected_hash: str, run_id: str) -> set[str]:
         if trajectory_id in seen:
             raise PipelineError(f"Duplicate trajectory_id in {path}: {trajectory_id}")
         seen.add(trajectory_id)
-        if row.get("generation_status") == "success" and RAW_REQUIRED_FIELDS <= set(row):
+        required_fields = RAW_REQUIRED_FIELDS
+        if row.get("subset") == "pilot":
+            required_fields = required_fields | {"question_index"}
+        if row.get("generation_status") == "success" and required_fields <= set(row):
             completed.add(trajectory_id)
         else:
             raise PipelineError(
@@ -269,7 +356,7 @@ def _update_run_manifest(
 def run_generation(
     config: Mapping[str, Any], subset: str, *, resume: bool, backend_name: str,
     limit: int | None = None, mock_fixture: str | None = None, max_retries: int = 2,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     if subset not in {"pilot", "seed_train", "anchor"}:
         raise PipelineError(f"Unsupported generation subset: {subset}")
     ensure_directories(config)
@@ -282,13 +369,18 @@ def run_generation(
         leaked = forbidden & set(question)
         if leaked:
             raise PipelineError(f"Answer leakage fields in generation input: {sorted(leaked)}")
-    questions.sort(key=lambda row: row["problem_id"])
     if subset == "pilot":
-        questions = questions[: int(config["pilot"]["n_problems"])]
+        questions = select_pilot_questions(
+            questions, config["pilot"], int(config["master_seed"])
+        )
+    else:
+        questions.sort(key=lambda row: row["problem_id"])
     if limit is not None:
         if limit <= 0:
             raise PipelineError("--limit must be positive")
         questions = questions[:limit]
+
+    selected_questions = pilot_selection_rows(questions) if subset == "pilot" else []
 
     backend: Backend
     if backend_name == "mock":
@@ -298,15 +390,33 @@ def run_generation(
     gen_hash = sha256_text(canonical_json(generation_config(config)))
     freeze_config(config["_meta"]["config_path"], config)
     _update_run_manifest(config, backend, subset, limit is not None, gen_hash)
+    if subset == "pilot":
+        write_json_atomic(experiment_root(config) / "reports" / "pilot_selection.json", {
+            "created_at": utc_now(),
+            "run_id": config["run_id"],
+            "source_subset": config["pilot"].get("source_subset", "dev"),
+            "selection_strategy": config["pilot"].get("selection_strategy", "id_order"),
+            "selection_seed": int(config["pilot"].get("selection_seed", config["master_seed"])),
+            "level_counts": config["pilot"].get("level_counts"),
+            "limited": limit is not None,
+            "selected_questions": selected_questions,
+        })
 
     events_path = run_root(config) / "generation_events.jsonl"
-    summary = {"expected": len(questions) * int(config["sampling"]["n_per_problem"]), "success": 0, "failed": 0, "skipped": 0}
+    summary: dict[str, Any] = {
+        "expected": len(questions) * int(config["sampling"]["n_per_problem"]),
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+    if subset == "pilot":
+        summary["selected_questions"] = selected_questions
     with append_jsonl(events_path) as event, append_jsonl(output_path) as append_output:
         _repair_incomplete_last_line(output_path, event)
         existing = _load_completed(output_path, gen_hash, str(config["run_id"]))
         if existing and not resume:
             raise PipelineError(f"Output already contains trajectories; pass --resume: {output_path}")
-        for question in questions:
+        for question_index, question in enumerate(questions, start=1):
             for sample_index in range(int(config["sampling"]["n_per_problem"])):
                 trajectory_id = f"{config['run_id']}:{question['problem_id']}:s{sample_index:02d}"
                 if trajectory_id in existing:
@@ -347,6 +457,7 @@ def run_generation(
                     "trajectory_id": trajectory_id,
                     "run_id": config["run_id"],
                     "problem_id": question["problem_id"],
+                    "question_index": question_index,
                     "subset": subset,
                     "sample_index": sample_index,
                     "model_id": config["model"]["id"],

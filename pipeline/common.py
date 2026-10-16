@@ -96,6 +96,38 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise PipelineError("Experiment v1 requires sampling.batch_size=1")
     if config["sampling"].get("system_prompt") is not None:
         raise PipelineError("Experiment v1 requires sampling.system_prompt=null")
+    pilot = config["pilot"]
+    try:
+        pilot_count = int(pilot.get("n_problems", 0))
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("pilot.n_problems must be an integer") from exc
+    if pilot_count <= 0:
+        raise PipelineError("pilot.n_problems must be positive")
+    if pilot.get("source_subset", "dev") != "dev":
+        raise PipelineError("Experiment v1 requires pilot.source_subset=dev")
+    selection_strategy = pilot.get("selection_strategy", "id_order")
+    if selection_strategy not in {"id_order", "random", "hardest", "level_counts"}:
+        raise PipelineError(
+            "pilot.selection_strategy must be id_order, random, hardest, or level_counts"
+        )
+    try:
+        int(pilot.get("selection_seed", config["master_seed"]))
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("pilot.selection_seed must be an integer") from exc
+    if selection_strategy == "level_counts":
+        raw_counts = pilot.get("level_counts")
+        if not isinstance(raw_counts, Mapping):
+            raise PipelineError("pilot.level_counts must be a mapping for levels 1..5")
+        try:
+            level_counts = {int(level): int(value) for level, value in raw_counts.items()}
+        except (TypeError, ValueError) as exc:
+            raise PipelineError("pilot.level_counts keys and values must be integers") from exc
+        if set(level_counts) != {1, 2, 3, 4, 5}:
+            raise PipelineError("pilot.level_counts must define every level from 1 through 5")
+        if any(value < 0 for value in level_counts.values()):
+            raise PipelineError("pilot.level_counts values must be non-negative")
+        if sum(level_counts.values()) != pilot_count:
+            raise PipelineError("pilot.level_counts values must sum to pilot.n_problems")
     threshold = float(config["pool"].get("near_duplicate_jaccard_threshold", -1))
     if not 0 <= threshold <= 1:
         raise PipelineError("pool.near_duplicate_jaccard_threshold must be between 0 and 1")

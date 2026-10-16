@@ -42,6 +42,11 @@ sampling:
 pilot:
   source_subset: dev
   n_problems: 100
+  selection_strategy: level_counts
+  selection_seed: 20261012
+  # Exact per-level composition for this pilot run. Change these counts for a
+  # new run; all five values must be non-negative and sum to n_problems.
+  level_counts: {1: 0, 2: 35, 3: 40, 4: 20, 5: 5}
 
 pool:
   min_distinct_correct: 2
