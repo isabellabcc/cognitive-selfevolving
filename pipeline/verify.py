@@ -19,37 +19,25 @@ from .common import (
     write_json_atomic,
     write_jsonl_atomic,
 )
-from .prepare_dataset import extract_balanced_boxed
-
-
 VERIFIER_CONFIG = {
     "version": 1,
     "prediction_source": "final_text_only",
-    "boxed_policy": "one_distinct_last_balanced",
-    "fallback_patterns": ["final_answer_label", "answer_label"],
+    "answer_policy": "single_explicit_gsm8k_hash_marker",
     "argument_order": "verify(gold, prediction)",
     "truncated_is_unverifiable": True,
 }
 
 
 def extract_prediction(final_text: str) -> tuple[str | None, str]:
-    boxes = extract_balanced_boxed(final_text)
-    if boxes:
-        distinct = list(dict.fromkeys(boxes))
-        if len(distinct) > 1:
-            return boxes[-1], "ambiguous"
-        if not boxes[-1]:
-            return None, "malformed"
-        return boxes[-1], "ok"
-    patterns = (
-        r"(?is)(?:final\s+answer)\s*(?:is|:|=)\s*(.+?)\s*$",
-        r"(?is)(?:answer)\s*(?:is|:|=)\s*(.+?)\s*$",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, final_text)
-        if match and match.group(1).strip():
-            return match.group(1).strip(), "ok"
-    return None, "missing"
+    matches = re.findall(r"####\s*([^\n]+)", final_text)
+    if not matches:
+        return None, "missing"
+    answers = [value.strip() for value in matches]
+    if any(not value for value in answers):
+        return None, "malformed"
+    if len(set(answers)) != 1:
+        return answers[-1], "ambiguous"
+    return answers[0], "ok"
 
 
 def load_math_verifier() -> tuple[Callable[[str], Any], Callable[[Any, Any], bool], str]:
@@ -147,7 +135,7 @@ def verify_record(
 
 def paths_for_subset(config: Mapping[str, Any], subset: str) -> tuple[Path, Path]:
     root = experiment_root(config)
-    prefix = "pilot_dev" if subset == "pilot" else subset
+    prefix = "pilot_seed_train" if subset == "pilot" else subset
     return root / "trajectories" / f"{prefix}_raw.jsonl", root / "verification" / f"{prefix}_verified.jsonl"
 
 
@@ -219,7 +207,7 @@ def run_verification(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--subset", required=True, choices=("pilot", "seed_train", "anchor"))
+    parser.add_argument("--subset", required=True, choices=("pilot", "seed_train"))
     parser.add_argument("--manual-review-export", nargs="?", const="manual_review.jsonl")
     return parser
 

@@ -3,5 +3,6 @@ __pycache__/
 .pytest_cache/
 
 # Generated experiment artifacts are reproducible and can be very large.
-data/experiment1/
+data/
 runs/
+.venv/

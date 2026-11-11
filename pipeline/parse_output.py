@@ -1,8 +1,12 @@
-"""Lossless parsing of Qwen3 thinking completions."""
+"""Parse GPT-J GSM8K completions without scanning arbitrary trailing numbers."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
+
+
+FINAL_PATTERN = re.compile(r"####\s*([^\n]+)")
 
 
 @dataclass(frozen=True)
@@ -17,27 +21,21 @@ class ParsedOutput:
 
 
 def parse_completion(raw_completion: str) -> ParsedOutput:
-    """Split a completion without changing or discarding its original text."""
     if not raw_completion or not raw_completion.strip():
         return ParsedOutput(raw_completion, "", "", "empty_output")
-
-    open_pos = raw_completion.find("<think>")
-    close_pos = raw_completion.find("</think>", open_pos + len("<think>") if open_pos >= 0 else 0)
-    if open_pos >= 0 and close_pos < 0:
-        reasoning = raw_completion[open_pos + len("<think>") :].strip()
-        return ParsedOutput(raw_completion, reasoning, "", "missing_think_end")
-    if close_pos >= 0:
-        reasoning_start = open_pos + len("<think>") if open_pos >= 0 else 0
-        reasoning = raw_completion[reasoning_start:close_pos].strip()
-        final = raw_completion[close_pos + len("</think>") :].strip()
-        if not final:
-            return ParsedOutput(raw_completion, reasoning, "", "missing_final")
-        return ParsedOutput(raw_completion, reasoning, final, "ok")
-
-    # Qwen's chat template can place the opening <think> marker in the input,
-    # so the newly decoded tokens legitimately contain only the closing marker.
-    # A completion with neither marker is a non-thinking, final-only response.
-    return ParsedOutput(raw_completion, "", raw_completion.strip(), "malformed")
+    matches = list(FINAL_PATTERN.finditer(raw_completion))
+    if not matches:
+        return ParsedOutput(raw_completion, raw_completion.strip(), "", "missing_final")
+    answers = [match.group(1).strip() for match in matches]
+    if any(not answer for answer in answers):
+        return ParsedOutput(raw_completion, raw_completion[:matches[0].start()].strip(), "", "malformed_final")
+    status = "ok" if len(set(answers)) == 1 else "ambiguous_final"
+    return ParsedOutput(
+        raw_completion,
+        raw_completion[:matches[0].start()].strip(),
+        f"#### {answers[-1]}",
+        status,
+    )
 
 
 def finish_reason(*, generated_token_count: int, max_new_tokens: int, eos_reached: bool) -> str:

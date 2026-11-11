@@ -1,67 +1,49 @@
 import json
 import sys
 import types
-from pathlib import Path
 
-from pipeline.prepare_dataset import (
-    PUBLIC_FIELDS,
-    assert_split_contract,
-    extract_balanced_boxed,
-    parse_level,
-    prepare,
-    split_selected,
-)
+from pipeline.prepare_dataset import PUBLIC_FIELDS, extract_gold, prepare
 
 
-def test_parse_level_and_nested_boxed():
-    assert parse_level("Level 4") == 4
-    assert parse_level(2) == 2
-    assert extract_balanced_boxed(r"work \boxed{\frac{1}{2}} end") == [r"\frac{1}{2}"]
+def test_extract_gsm8k_gold():
+    assert extract_gold("work <<1+1=2>>\n#### 2") == "2"
+    assert extract_gold("work\n#### 1,234") == "1234"
 
 
-def test_seeded_split_is_disjoint_and_has_no_gold():
-    records = []
-    for index in range(6):
-        record = {
-            "problem_id": f"p{index}", "source_repo": "r", "source_config": "c",
-            "source_split": "train", "source_row_index": index, "level": 1,
-            "topic": "Algebra", "problem": f"q{index}", "problem_sha256": f"h{index}",
-        }
-        records.append(record)
-    first = split_selected(records, {"seed_train": 3, "anchor": 2, "dev": 1}, 42)
-    second = split_selected(records, {"seed_train": 3, "anchor": 2, "dev": 1}, 42)
-    assert first == second
-    assert_split_contract(first, {"seed_train": 3, "anchor": 2, "dev": 1})
-    assert all(set(row) == PUBLIC_FIELDS for rows in first.values() for row in rows)
-
-
-def test_all_seven_configs_are_loaded(tmp_path, monkeypatch):
-    config_names = [f"config_{index}" for index in range(7)]
+def test_prepare_gsm8k_splits_are_disjoint_and_hide_answers(tmp_path, monkeypatch):
+    train = [
+        {"question": f"Train question {index}?", "answer": f"work {index}\n#### {index}"}
+        for index in range(12)
+    ]
+    test = [
+        {"question": f"Test question {index}?", "answer": f"test work {index}\n#### {index}"}
+        for index in range(3)
+    ]
     calls = []
-
-    def fake_load_dataset(repo_id, name, split):
-        calls.append(name)
-        base = config_names.index(name) * 5
-        return [
-            {
-                "problem": f"Problem {base + index}", "solution": rf"proof \boxed{{{base + index}}}",
-                "level": f"Level {(base + index) % 5 + 1}", "type": f"Topic{index % 2}",
-            }
-            for index in range(5)
-        ]
-
+    def fake_load_dataset(repo_id, config_name, revision):
+        calls.append((repo_id, config_name, revision))
+        return {"train": train, "test": test}
     monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
     config = {
         "dataset": {
-            "repo_id": "repo", "split": "train", "configs": config_names,
-            "subset_sizes": {"seed_train": 2, "anchor": 1, "dev": 1},
-            "target_level_ratios": {1: .2, 2: .2, 3: .2, 4: .2, 5: .2},
-            "exclude_asymptote": True, "split_seed": 42,
+            "repo_id": "openai/gsm8k", "config_name": "main", "revision": "main",
+            "split_seed": 42, "few_shot_indices": [0, 2], "validation_size": 2,
+            "generation_size": 5,
         },
         "paths": {"root": str(tmp_path / "data"), "run_root": str(tmp_path / "run")},
     }
     report = prepare(config)
-    assert calls == config_names
-    assert report["raw_total"] == 35
-    public_rows = [json.loads(line) for line in (tmp_path / "data/splits/seed_train.jsonl").read_text().splitlines()]
-    assert all(not ({"solution", "gold_answer"} & set(row)) for row in public_rows)
+    assert calls == [("openai/gsm8k", "main", "main")]
+    assert report["counts"] == {
+        "seed_train": 5, "validation": 2, "reserve": 3, "test": 3, "few_shot": 2,
+    }
+    root = tmp_path / "data"
+    split_rows = {
+        name: [json.loads(line) for line in (root / f"splits/{name}.jsonl").read_text().splitlines()]
+        for name in ("seed_train", "validation", "reserve", "test")
+    }
+    assert all(set(row) == PUBLIC_FIELDS for rows in split_rows.values() for row in rows)
+    ids = [set(row["problem_id"] for row in rows) for rows in split_rows.values()]
+    assert all(not ids[i] & ids[j] for i in range(len(ids)) for j in range(i + 1, len(ids)))
+    prompt_rows = [json.loads(line) for line in (root / "prompts/few_shot.jsonl").read_text().splitlines()]
+    assert len(prompt_rows) == 2 and all("####" in row["answer"] for row in prompt_rows)

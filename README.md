@@ -1,77 +1,222 @@
-# Cognitive-guided trajectory sampling · Experiment 1
+# Single-round STaR on GSM8K with GPT-J 6B
 
-本仓库实现 `trajectory_pool_plan.md` 定义的第一期流水线：只负责 MATH Train 数据准备、Qwen3 自生成轨迹、最终答案验证、同题文本去重和候选池冻结，不包含认知评分、MIRT、排序、SFT 或多轮进化。
+本仓库实现单轮 STaR 方法级复现和固定正确轨迹池上的子样本微调对照。旧的 MATH/Qwen3 流水线已删除；当前唯一实验契约是：
 
-`verification_status=correct` 仅表示最终答案通过数学等价校验，不代表推理过程正确。
+- 数据集：`openai/gsm8k`, config `main`
+- 基模：`EleutherAI/gpt-j-6b`
+- 生成：论文风格的纯文本 few-shot `Q:/A:` prompt，贪心解码，输出以 `#### answer` 结束
+- 验证：只验证最终答案数学等价，不声称推理过程正确
+- 微调：PEFT LoRA，prompt/padding loss 全部 mask，只监督模型生成的 rationale + final answer
+- 对照：同一 `pool_hash` 下的 full、random 25/50/75%、exact dedup；另行比较 with/without rationalization
 
-## 模块与数据边界
+论文使用 GPT-J 6B 与 GSM8K，并在每轮从原始预训练模型重新训练。原论文是 TPU 上的全参数训练；本仓库为了单卡 AutoDL 可运行，采用 LoRA，因此属于现代方法级复现而非论文数值复现。
 
-| 命令模块 | 读取 | 写入 |
-| --- | --- | --- |
-| `pipeline.prepare_dataset` | Hugging Face MATH train 的 7 个配置 | `splits/`、`private/gold_answers.jsonl`、数据审计与报告 |
-| `pipeline.generate` | 仅 `splits/*.jsonl` 中的公开题干 | `trajectories/*_raw.jsonl`、run manifest、事件日志 |
-| `pipeline.verify` | 原始轨迹与私有 gold | `verification/*_verified.jsonl`，不调用生成模型 |
-| `pipeline.build_pool` | 仅 seed_train raw/verified 与题目元数据 | `pool/` 下候选、去重审计及冻结 manifest |
-| `pipeline.report` | 前述阶段文件 | `reports/pilot_report.json` 或综合报告 |
+## 1. 本地提交到 GitHub
 
-生成模块会主动拒绝包含 `solution`、`gold_answer` 或 `source_solution` 的输入记录。原始 completion 不会被验证或建池模块改写。
-
-## 目标命令
-
-依赖版本应在正式运行环境中安装并锁定；本仓库不包含模型权重或下载产物。
+确认测试通过后，把新版放到独立分支：
 
 ```bash
-python -m pipeline.prepare_dataset --config configs/experiment1.yaml --validate-only
-python -m pipeline.prepare_dataset --config configs/experiment1.yaml
-
-python -m pipeline.generate --config configs/experiment1.yaml --subset pilot --resume
-python -m pipeline.verify --config configs/experiment1.yaml --subset pilot
-python -m pipeline.report --config configs/experiment1.yaml --stage pilot
-
-python -m pipeline.generate --config configs/experiment1.yaml --subset seed_train --resume
-python -m pipeline.generate --config configs/experiment1.yaml --subset anchor --resume
-python -m pipeline.verify --config configs/experiment1.yaml --subset seed_train
-python -m pipeline.verify --config configs/experiment1.yaml --subset anchor
-
-python -m pipeline.build_pool --config configs/experiment1.yaml --freeze
-python -m pipeline.report --config configs/experiment1.yaml --stage all
-pytest -q
+git checkout -b star-gsm8k-single-round
+python -m pytest -q
+git add -A
+git commit -m "replace MATH Qwen pipeline with GSM8K GPT-J STaR"
+git push -u origin star-gsm8k-single-round
 ```
 
-正式运行前在目标环境记录依赖与硬件信息：
+## 2. AutoDL 环境建议
+
+当前实现不做 4-bit 量化。GPT-J 6B 的 fp16 LoRA：24GB 显存可先跑 32 题 pilot，但正式 4,000 题生成和 1024-token SFT 推荐 40GB/48GB GPU；系统内存建议至少 32GB，数据盘预留 50GB。选择带 PyTorch、CUDA 12.x、Python 3.10/3.11 的镜像。
+
+在 AutoDL 数据盘操作：
 
 ```bash
-pip freeze > runs/math_qwen3_17b_v1/requirements.lock.txt
+cd /root/autodl-tmp
+git clone --branch star-gsm8k-single-round --single-branch \
+  https://github.com/isabellabcc/cognitive-selfevolving.git
+cd cognitive-selfevolving
+
+python -m venv --system-site-packages .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+nvidia-smi
+python - <<'PY'
+import torch
+print(torch.__version__, torch.version.cuda)
+print(torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0).total_memory / 2**30)
+PY
+python -m pytest -q
+python -m pipeline.prepare_dataset --config configs/gsm8k_gptj6b_single_round.yaml --validate-only
 ```
 
-代码会把 Python、平台以及可读取的核心包版本写入 `run_manifest.json`；模型加载后还会记录解析得到的 revision、设备和 dtype。
-
-## 无 GPU 的 mock 流程
-
-`--backend mock` 不加载模型。可通过 `--mock-fixture` 传入每行包含 `problem_id`、`sample_index`、`raw_completion` 和可选 `finish_reason` 的 JSONL。请复制配置并为 mock 使用独立的 `run_id`、`paths.root` 和 `paths.run_root`，不要污染正式 run：
+缓存放到数据盘：
 
 ```bash
-python -m pipeline.generate \
-  --config configs/experiment1.yaml \
-  --subset pilot --backend mock --mock-fixture tests/fixtures/mock_completions.jsonl --resume
+export HF_HOME=/root/autodl-tmp/hf-cache
+export HF_DATASETS_CACHE=/root/autodl-tmp/hf-cache/datasets
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 ```
 
-默认 mock 后端也能生成确定性占位输出，但它仅用于验证 I/O 和续跑，不用于评估数学正确率。
+如果服务器只能通过镜像访问 Hugging Face，可在 shell 中临时设置 `HF_ENDPOINT`；不要把镜像地址或 token 提交到仓库。
 
-## 续跑、调试与冻结
+复制一份运行配置到仓库外，避免以后 `git pull` 与服务器本地路径发生冲突：
 
-- 每条轨迹写入后立即 flush/fsync。`--resume` 只跳过 schema 完整且状态为 success 的稳定 ID。
-- 不完整的 JSONL 末行会被移除并写入 `generation_events.jsonl`；其它位置损坏会直接报错。
-- 同一 run 的配置哈希、生成参数哈希或模型 revision 改变时会拒绝混写，应改用新的 `run_id` 和路径。
-- `--limit N` 只用于调试；run manifest 会记录 limited，正式 `--freeze` 会拒绝该 seed_train 运行。
-- 若有效题不足目标值，建池会先写真实缺口报告，再以非零状态退出；不会用单条正确轨迹题目补足。
-- 冻结 manifest 记录所有输入与输出 SHA256。输入变化后不能复用已冻结池。
+```bash
+mkdir -p /root/autodl-tmp/star/configs
+cp configs/gsm8k_gptj6b_single_round.yaml /root/autodl-tmp/star/configs/gsm8k_gptj6b_r0.yaml
+CONFIG=/root/autodl-tmp/star/configs/gsm8k_gptj6b_r0.yaml
+```
 
-## 常见错误恢复
+编辑 `$CONFIG`，把两个路径改成绝对数据盘路径，并为本次实验保留唯一 run：
 
-- OOM：错误会进入事件日志。不要在原 run 内临时降低 `max_new_tokens`；修改配置并启用新 `run_id`。
-- gold 缺失或 raw/verified ID 不一一对应：修复上游数据后重新执行对应阶段，不要直接编辑候选池。
-- `unverifiable` 比例异常：使用 `--manual-review-export [PATH]` 导出全部 unverifiable 及 correct/incorrect 分层样本，修复验证规则后再冻结。
-- 候选池不足 600 题：保留缺口报告，按规格建立新的扩容 run 或新的较小实验配置。
+```yaml
+paths:
+  root: /root/autodl-tmp/star/data/gsm8k_gptj6b_r0
+  run_root: /root/autodl-tmp/star/runs/gsm8k_gptj6b_r0
+```
 
-真实数据下载、Qwen3 推理和正式冻结需要目标机器上的依赖、网络与模型硬件；仓库测试使用 mock 数据，不声称已经完成真实实验。
+## 3. 数据准备和 32 题 pilot
+
+以下命令才会下载 GSM8K；模型在第一次真实生成/评测时下载。
+
+```bash
+python -m pipeline.prepare_dataset --config "$CONFIG"
+
+python -m pipeline.generate --config "$CONFIG" --subset pilot --resume
+python -m pipeline.verify --config "$CONFIG" --subset pilot
+```
+
+检查：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+p = Path('/root/autodl-tmp/star/data/gsm8k_gptj6b_r0/verification/pilot_seed_train_verified.jsonl')
+rows = [json.loads(x) for x in p.read_text().splitlines()]
+from collections import Counter
+print(Counter(r['verification_status'] for r in rows))
+PY
+```
+
+若全部 `unverifiable`，先检查 completion 是否出现 `#### number`；若大量 `length`，再检查 stopping criteria 和 `max_new_tokens`，不要直接进入正式生成。
+
+## 4. 基模验证集基线
+
+先只打印计划，再显式运行：
+
+```bash
+python -m pipeline.evaluate_star --config "$CONFIG" --checkpoint base --split validation
+python -m pipeline.evaluate_star --config "$CONFIG" --checkpoint base --split validation --run
+```
+
+官方 test 暂时不要运行，避免根据测试集反复调参。
+
+## 5. 普通生成、验证与固定池
+
+```bash
+python -m pipeline.generate --config "$CONFIG" --subset seed_train --resume
+python -m pipeline.verify --config "$CONFIG" --subset seed_train
+python -m pipeline.star_pool build-pool --config "$CONFIG" --branch ordinary
+```
+
+记录下面文件的 `pool_hash` 和正确轨迹数：
+
+```text
+/root/autodl-tmp/star/data/gsm8k_gptj6b_r0/star/pools/ordinary_manifest.json
+```
+
+## 6. 创建一个选择并训练
+
+全量示例：
+
+```bash
+python -m pipeline.star_pool select \
+  --config "$CONFIG" --branch ordinary --method all --seed 42 \
+  | tee /tmp/star_selection.json
+
+SEL=$(python -c "import json; print(json.load(open('/tmp/star_selection.json'))['selection_id'])")
+echo "$SEL"
+
+python -m pipeline.sft --config "$CONFIG" --selection-id "$SEL" --seed 42
+python -m pipeline.sft --config "$CONFIG" --selection-id "$SEL" --seed 42 --run
+
+ADAPTER=/root/autodl-tmp/star/runs/gsm8k_gptj6b_r0/star/${SEL}-train-s42/adapter
+python -m pipeline.evaluate_star \
+  --config "$CONFIG" --checkpoint "$ADAPTER" --split validation --run
+```
+
+每个条件都会从配置中的原始 GPT-J 基座独立初始化；不要把某个子集 adapter 填回 `model.adapter_path` 后再训练另一个子集。
+
+## 7. 子样本实验矩阵
+
+普通池至少运行：
+
+| condition | selector | fraction | selection/train seeds |
+| --- | --- | ---: | --- |
+| `star_full` | all | 1.00 | 42 |
+| `star_rand25` | random | 0.25 | 42, 43, 44 |
+| `star_rand50` | random | 0.50 | 42, 43, 44 |
+| `star_rand75` | random | 0.75 | 42, 43, 44 |
+| `star_exact_dedup` | exact_dedup | 1.00 | 42 |
+
+随机 50% 示例：
+
+```bash
+for SEED in 42 43 44; do
+  OUT=/tmp/star-rand50-${SEED}.json
+  python -m pipeline.star_pool select \
+    --config "$CONFIG" --branch ordinary --method random --fraction 0.50 --seed "$SEED" \
+    | tee "$OUT"
+  SEL=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['selection_id'])" "$OUT")
+  python -m pipeline.sft --config "$CONFIG" --selection-id "$SEL" --seed "$SEED" --run
+  ADAPTER=/root/autodl-tmp/star/runs/gsm8k_gptj6b_r0/star/${SEL}-train-s${SEED}/adapter
+  python -m pipeline.evaluate_star \
+    --config "$CONFIG" --checkpoint "$ADAPTER" --split validation --run
+done
+```
+
+将 `0.50` 分别替换为 `0.25` 和 `0.75`。精确去重使用 `--method exact_dedup` 且不传 fraction。所有同池比较必须确认 `selection_manifest.json` 中的 `pool_hash` 相同。
+
+## 8. Rationalization 分支
+
+```bash
+python -m pipeline.rationalize generate --config "$CONFIG" --resume
+python -m pipeline.rationalize verify --config "$CONFIG"
+python -m pipeline.star_pool build-pool \
+  --config "$CONFIG" --branch with_rationalization
+```
+
+然后至少在新池上运行 `all` 和 `random --fraction 0.50`。该池的 `pool_hash` 必然不同；其结果用于比较 STaR 候选池生成机制，不能与 ordinary 同池筛选器混为一谈。
+
+## 9. 汇总与最终测试
+
+```bash
+python -m pipeline.star_report --config "$CONFIG"
+```
+
+结果位于：
+
+```text
+data/gsm8k_gptj6b_r0/star/reports/results.csv
+data/gsm8k_gptj6b_r0/star/reports/results.md
+```
+
+根据 validation 预先确定最终条件后，每个最终条件只运行一次官方 test：
+
+```bash
+python -m pipeline.evaluate_star \
+  --config "$CONFIG" --checkpoint "$ADAPTER" --split test --run
+python -m pipeline.star_report --config "$CONFIG"
+```
+
+## 10. 续跑和故障处理
+
+- 生成和 rationalization 支持 `--resume`，会跳过完整 trajectory ID。
+- 修改模型、prompt、采样参数或数据拆分后，必须更换 `run_id` 和两个输出目录。
+- SFT run 目录已存在时不会覆盖；确认是失败残留后手工移动目录留档，再重跑。
+- OOM 时先把 `max_seq_length` 降到 768 或将 GPU 换到 40/48GB；所有实验条件必须使用相同长度规则。
+- test 不参与 prompt、超参数、样本选择或停止条件调整。
+
+更严格的方法映射和公平性约束见 `docs/star_method_mapping.md` 与 `docs/star_experiment_protocol.md`。

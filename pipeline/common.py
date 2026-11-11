@@ -8,6 +8,7 @@ import os
 import platform
 import random
 import re
+import subprocess
 import tempfile
 import unicodedata
 from contextlib import contextmanager
@@ -79,23 +80,33 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
-    required = {"project", "run_id", "master_seed", "dataset", "model", "sampling", "pilot", "pool", "paths"}
+    required = {"project", "run_id", "master_seed", "dataset", "model", "sampling", "pilot", "star", "paths"}
     missing = sorted(required - set(config))
     if missing:
         raise PipelineError(f"Missing config sections: {', '.join(missing)}")
-    configs = config["dataset"].get("configs", [])
-    if len(configs) != 7 or len(set(configs)) != 7:
-        raise PipelineError("dataset.configs must contain seven unique MATH configurations")
-    sizes = config["dataset"].get("subset_sizes", {})
-    if any(int(sizes.get(name, 0)) <= 0 for name in ("seed_train", "anchor", "dev")):
-        raise PipelineError("All dataset subset sizes must be positive")
-    ratios = {int(k): float(v) for k, v in config["dataset"].get("target_level_ratios", {}).items()}
-    if set(ratios) != {1, 2, 3, 4, 5} or abs(sum(ratios.values()) - 1.0) > 1e-9:
-        raise PipelineError("target_level_ratios must define levels 1..5 and sum to 1")
+    dataset = config["dataset"]
+    if dataset.get("repo_id") != "openai/gsm8k" or dataset.get("config_name") != "main":
+        raise PipelineError("This project requires dataset openai/gsm8k, config main")
+    for field in ("validation_size", "generation_size"):
+        if int(dataset.get(field, 0)) <= 0:
+            raise PipelineError(f"dataset.{field} must be positive")
+    few_shot_indices = dataset.get("few_shot_indices")
+    if not isinstance(few_shot_indices, list) or not few_shot_indices:
+        raise PipelineError("dataset.few_shot_indices must be a non-empty list")
+    if any(int(index) < 0 for index in few_shot_indices) or len(set(few_shot_indices)) != len(few_shot_indices):
+        raise PipelineError("dataset.few_shot_indices must be unique non-negative integers")
+    if len(few_shot_indices) + sum(int(dataset[field]) for field in ("validation_size", "generation_size")) >= 7473:
+        raise PipelineError("Configured GSM8K train partitions leave no reserve examples")
+    if config["model"].get("id") != "EleutherAI/gpt-j-6b":
+        raise PipelineError("This reproduction requires EleutherAI/gpt-j-6b")
     if int(config["sampling"].get("batch_size", 0)) != 1:
         raise PipelineError("Experiment v1 requires sampling.batch_size=1")
-    if config["sampling"].get("system_prompt") is not None:
-        raise PipelineError("Experiment v1 requires sampling.system_prompt=null")
+    if config["sampling"].get("prompt_version") != "gsm8k_star_v1":
+        raise PipelineError("sampling.prompt_version must be gsm8k_star_v1")
+    if int(config["sampling"].get("n_per_problem", 0)) != 1:
+        raise PipelineError("The registered single-round experiment requires n_per_problem=1")
+    if bool(config["sampling"].get("do_sample", True)):
+        raise PipelineError("The registered GPT-J STaR generation must use greedy decoding")
     pilot = config["pilot"]
     try:
         pilot_count = int(pilot.get("n_problems", 0))
@@ -103,36 +114,26 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise PipelineError("pilot.n_problems must be an integer") from exc
     if pilot_count <= 0:
         raise PipelineError("pilot.n_problems must be positive")
-    if pilot.get("source_subset", "dev") != "dev":
-        raise PipelineError("Experiment v1 requires pilot.source_subset=dev")
-    selection_strategy = pilot.get("selection_strategy", "id_order")
-    if selection_strategy not in {"id_order", "random", "hardest", "level_counts"}:
-        raise PipelineError(
-            "pilot.selection_strategy must be id_order, random, hardest, or level_counts"
-        )
+    if pilot_count > int(dataset["generation_size"]):
+        raise PipelineError("pilot.n_problems cannot exceed dataset.generation_size")
     try:
         int(pilot.get("selection_seed", config["master_seed"]))
     except (TypeError, ValueError) as exc:
         raise PipelineError("pilot.selection_seed must be an integer") from exc
-    if selection_strategy == "level_counts":
-        raw_counts = pilot.get("level_counts")
-        if not isinstance(raw_counts, Mapping):
-            raise PipelineError("pilot.level_counts must be a mapping for levels 1..5")
-        try:
-            level_counts = {int(level): int(value) for level, value in raw_counts.items()}
-        except (TypeError, ValueError) as exc:
-            raise PipelineError("pilot.level_counts keys and values must be integers") from exc
-        if set(level_counts) != {1, 2, 3, 4, 5}:
-            raise PipelineError("pilot.level_counts must define every level from 1 through 5")
-        if any(value < 0 for value in level_counts.values()):
-            raise PipelineError("pilot.level_counts values must be non-negative")
-        if sum(level_counts.values()) != pilot_count:
-            raise PipelineError("pilot.level_counts values must sum to pilot.n_problems")
-    threshold = float(config["pool"].get("near_duplicate_jaccard_threshold", -1))
-    if not 0 <= threshold <= 1:
-        raise PipelineError("pool.near_duplicate_jaccard_threshold must be between 0 and 1")
-    if int(config["pool"].get("dedup_token_ngram", 0)) <= 0:
-        raise PipelineError("pool.dedup_token_ngram must be positive")
+    star = config.get("star")
+    if star is not None:
+        if not isinstance(star, Mapping):
+            raise PipelineError("star must be a mapping")
+        training = star.get("training", {})
+        if float(training.get("learning_rate", 0)) <= 0:
+            raise PipelineError("star.training.learning_rate must be positive")
+        if int(training.get("max_seq_length", 0)) <= 0:
+            raise PipelineError("star.training.max_seq_length must be positive")
+        if int(training.get("epochs", 0)) <= 0:
+            raise PipelineError("star.training.epochs must be positive")
+        evaluation = star.get("evaluation", {})
+        if int(evaluation.get("max_new_tokens", 0)) <= 0:
+            raise PipelineError("star.evaluation.max_new_tokens must be positive")
 
 
 def experiment_root(config: Mapping[str, Any]) -> Path:
@@ -145,7 +146,7 @@ def run_root(config: Mapping[str, Any]) -> Path:
 
 def ensure_directories(config: Mapping[str, Any]) -> None:
     root = experiment_root(config)
-    for relative in ("raw", "splits", "private", "trajectories", "verification", "pool", "reports", "audits"):
+    for relative in ("raw", "splits", "prompts", "private", "trajectories", "verification", "star", "reports", "audits"):
         (root / relative).mkdir(parents=True, exist_ok=True)
     run_root(config).mkdir(parents=True, exist_ok=True)
 
@@ -236,13 +237,25 @@ def freeze_config(config_path: str | Path, config: Mapping[str, Any]) -> None:
 
 def runtime_versions() -> dict[str, Any]:
     result: dict[str, Any] = {"python": platform.python_version(), "platform": platform.platform()}
-    for package in ("torch", "transformers", "datasets", "math_verify", "sympy"):
+    for package in ("torch", "transformers", "datasets", "peft", "math_verify", "sympy"):
         try:
             module = __import__(package)
             result[package] = getattr(module, "__version__", "unknown")
         except ImportError:
             result[package] = None
     return result
+
+
+def git_commit() -> str | None:
+    """Return the repository commit without making Git a runtime requirement."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
 
 
 def seeded_order(items: Iterable[Any], seed: int, key=lambda item: item) -> list[Any]:

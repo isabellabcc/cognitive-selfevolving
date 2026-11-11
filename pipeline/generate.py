@@ -1,4 +1,4 @@
-"""Generate independent Qwen3 thinking trajectories with safe resume support."""
+"""Generate GPT-J GSM8K rationales with deterministic resume support."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -17,26 +18,19 @@ from .common import (
     ensure_directories,
     experiment_root,
     freeze_config,
+    git_commit,
     load_config,
     read_jsonl,
     run_root,
     runtime_versions,
+    sha256_file,
     sha256_text,
     stable_seed,
     utc_now,
     write_json_atomic,
 )
 from .parse_output import finish_reason, parse_completion
-
-
-PROMPTS = {
-    "math_cot_v1": (
-        "Solve the following math problem step by step.\n"
-        "Show the necessary mathematical reasoning.\n"
-        "Put your final answer in \\boxed{{}}.\n\n"
-        "Problem: {problem}"
-    )
-}
+from .prompts import PROMPT_VERSION, build_prompt, load_few_shot
 
 RAW_REQUIRED_FIELDS = {
     "trajectory_id", "run_id", "problem_id", "subset", "sample_index",
@@ -45,6 +39,21 @@ RAW_REQUIRED_FIELDS = {
     "format_status", "finish_reason", "generation_status", "prompt_token_count",
     "completion_token_count", "completion_sha256", "created_at",
 }
+
+
+def gsm8k_stopping_criteria(tokenizer: Any, prompt_length: int) -> Any:
+    """Stop after a complete `#### answer` line instead of waiting for GPT-J EOS."""
+    try:
+        from transformers import StoppingCriteria, StoppingCriteriaList
+    except ImportError as exc:
+        raise PipelineError("transformers is required to build stopping criteria") from exc
+
+    class FinalAnswerLine(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            generated = tokenizer.decode(input_ids[0, prompt_length:], skip_special_tokens=False)
+            return bool(re.search(r"####\s*[^\n]+\n", generated))
+
+    return StoppingCriteriaList([FinalAnswerLine()])
 
 
 class Backend(Protocol):
@@ -75,7 +84,7 @@ class MockBackend:
         row = self._items.get(getattr(self, "_task", ("", -1)))
         if row is None:
             answer = seed % 17
-            raw = f"<think>Deterministic mock reasoning for seed {seed}.</think>\n\\boxed{{{answer}}}"
+            raw = f"Deterministic mock reasoning for seed {seed}.\n#### {answer}"
             reason = "eos"
         else:
             raw = str(row.get("raw_completion", ""))
@@ -99,20 +108,57 @@ class TransformersBackend:
             raise PipelineError("torch and transformers are required for the transformers backend") from exc
         self.torch = torch
         model_cfg = config["model"]
-        self.tokenizer = AutoTokenizer.from_pretrained(model_cfg["id"], revision=model_cfg["revision"])
-        dtype_value = model_cfg.get("torch_dtype", "auto")
-        kwargs: dict[str, Any] = {"revision": model_cfg["revision"], "torch_dtype": dtype_value}
+        local_files_only = bool(model_cfg.get("local_files_only", False))
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_cfg["id"], revision=model_cfg["revision"], local_files_only=local_files_only
+        )
+        dtype_name = model_cfg.get("torch_dtype", "auto")
+        dtype_value = {
+            "float16": torch.float16, "bfloat16": torch.bfloat16,
+            "float32": torch.float32, "auto": "auto",
+        }.get(dtype_name)
+        if dtype_value is None:
+            raise PipelineError(f"Unsupported model.torch_dtype: {dtype_name}")
+        kwargs: dict[str, Any] = {
+            "revision": model_cfg["revision"], "torch_dtype": dtype_value,
+            "local_files_only": local_files_only,
+        }
         device_setting = model_cfg.get("device", "auto")
         if device_setting == "auto":
             kwargs["device_map"] = "auto"
         self.model = AutoModelForCausalLM.from_pretrained(model_cfg["id"], **kwargs)
+        adapter_path = model_cfg.get("adapter_path")
+        adapter_fingerprint = None
+        if adapter_path:
+            try:
+                from peft import PeftModel
+            except ImportError as exc:
+                raise PipelineError("peft is required when model.adapter_path is configured") from exc
+            adapter = Path(str(adapter_path))
+            if not adapter.is_dir():
+                raise PipelineError(f"Configured adapter directory does not exist: {adapter}")
+            fingerprint_files = [
+                path for path in (adapter / "adapter_config.json", adapter / "adapter_model.safetensors", adapter / "adapter_model.bin")
+                if path.exists()
+            ]
+            if not fingerprint_files:
+                raise PipelineError(f"No PEFT adapter files found in {adapter}")
+            adapter_fingerprint = sha256_text(canonical_json({
+                path.name: sha256_file(path) for path in fingerprint_files
+            }))
+            self.model = PeftModel.from_pretrained(
+                self.model, str(adapter), local_files_only=local_files_only
+            )
         if device_setting not in ("auto", None):
             self.model.to(device_setting)
         self.model.eval()
-        self.model_revision = str(
+        base_revision = str(
             getattr(self.model.config, "_commit_hash", None)
             or getattr(self.tokenizer, "_commit_hash", None)
             or model_cfg["revision"]
+        )
+        self.model_revision = (
+            f"{base_revision}+adapter:{adapter_fingerprint}" if adapter_fingerprint else base_revision
         )
         self.device = str(self.model.device)
         self.dtype = str(self.model.dtype).replace("torch.", "")
@@ -127,26 +173,27 @@ class TransformersBackend:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        messages = [{"role": "user", "content": prompt}]
-        encoded = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=bool(self.config["model"].get("enable_thinking", True)),
-            return_tensors="pt",
-        )
-        encoded = encoded.to(self.model.device)
-        attention_mask = torch.ones_like(encoded, dtype=torch.long)
+        batch = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        encoded = batch["input_ids"].to(self.model.device)
+        attention_mask = batch["attention_mask"].to(self.model.device)
         sampling = self.config["sampling"]
+        generation_kwargs: dict[str, Any] = {
+            "do_sample": bool(sampling["do_sample"]),
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.eos_token_id,
+            "stopping_criteria": gsm8k_stopping_criteria(self.tokenizer, int(encoded.shape[-1])),
+        }
+        if generation_kwargs["do_sample"]:
+            generation_kwargs.update({
+                "temperature": float(sampling["temperature"]),
+                "top_p": float(sampling["top_p"]),
+                "top_k": int(sampling["top_k"]),
+            })
         with torch.inference_mode():
             output = self.model.generate(
                 encoded,
                 attention_mask=attention_mask,
-                do_sample=bool(sampling["do_sample"]),
-                temperature=float(sampling["temperature"]),
-                top_p=float(sampling["top_p"]),
-                top_k=int(sampling["top_k"]),
-                max_new_tokens=max_new_tokens,
+                **generation_kwargs,
             )
         new_tokens = output[0, encoded.shape[-1] :]
         eos_ids = self.model.generation_config.eos_token_id
@@ -157,7 +204,7 @@ class TransformersBackend:
         else:
             eos_set = set(eos_ids)
         eos_reached = bool(len(new_tokens) and int(new_tokens[-1]) in eos_set)
-        raw = self.tokenizer.decode(new_tokens, skip_special_tokens=False)
+        raw = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         return {
             "raw_completion": raw,
             "prompt_token_count": int(encoded.shape[-1]),
@@ -182,7 +229,7 @@ def generation_config(config: Mapping[str, Any]) -> dict[str, Any]:
 def paths_for_subset(config: Mapping[str, Any], subset: str) -> tuple[Path, Path]:
     root = experiment_root(config)
     if subset == "pilot":
-        return root / "splits" / "dev.jsonl", root / "trajectories" / "pilot_dev_raw.jsonl"
+        return root / "splits" / "seed_train.jsonl", root / "trajectories" / "pilot_seed_train_raw.jsonl"
     return root / "splits" / f"{subset}.jsonl", root / "trajectories" / f"{subset}_raw.jsonl"
 
 
@@ -196,64 +243,9 @@ def select_pilot_questions(
             f"Pilot requests {count} problems, but its source split contains only {len(questions)}"
         )
 
-    strategy = str(pilot_config.get("selection_strategy", "id_order"))
     seed = int(pilot_config.get("selection_seed", master_seed))
     ordered = sorted(questions, key=lambda row: str(row["problem_id"]))
-
-    if strategy == "level_counts":
-        configured_counts = {
-            int(level): int(value)
-            for level, value in pilot_config["level_counts"].items()
-        }
-        if set(configured_counts) != {1, 2, 3, 4, 5}:
-            raise PipelineError("Pilot level_counts must define every level from 1 through 5")
-        if any(value < 0 for value in configured_counts.values()):
-            raise PipelineError("Pilot level_counts values must be non-negative")
-        if sum(configured_counts.values()) != count:
-            raise PipelineError("Pilot level_counts values must sum to n_problems")
-        by_level: dict[int, list[dict[str, Any]]] = {level: [] for level in range(1, 6)}
-        for question in ordered:
-            try:
-                level = int(question["level"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PipelineError(
-                    "Pilot level_counts selection requires integer question levels"
-                ) from exc
-            if level not in by_level:
-                raise PipelineError(f"Pilot source contains an unsupported level: {level}")
-            by_level[level].append(question)
-
-        shortages = {
-            level: {"requested": configured_counts[level], "available": len(by_level[level])}
-            for level in range(1, 6)
-            if configured_counts[level] > len(by_level[level])
-        }
-        if shortages:
-            raise PipelineError(
-                "Pilot level_counts exceed the source split capacity: "
-                f"{canonical_json(shortages)}"
-            )
-
-        selected: list[dict[str, Any]] = []
-        for level in range(1, 6):
-            candidates = by_level[level]
-            random.Random(stable_seed(seed, "pilot_level", level)).shuffle(candidates)
-            selected.extend(candidates[: configured_counts[level]])
-        random.Random(stable_seed(seed, "pilot_selected_order")).shuffle(selected)
-        return selected
-    if strategy == "random":
-        random.Random(seed).shuffle(ordered)
-    elif strategy == "hardest":
-        # Randomize ties reproducibly, then use Python's stable sort to put the
-        # highest MATH levels first.
-        random.Random(seed).shuffle(ordered)
-        try:
-            ordered.sort(key=lambda row: int(row["level"]), reverse=True)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PipelineError("Pilot hardest selection requires integer question levels") from exc
-    elif strategy != "id_order":
-        raise PipelineError(f"Unsupported pilot.selection_strategy: {strategy}")
-
+    random.Random(seed).shuffle(ordered)
     return ordered[:count]
 
 
@@ -263,8 +255,7 @@ def pilot_selection_rows(questions: list[dict[str, Any]]) -> list[dict[str, Any]
         {
             "question_index": question_index,
             "problem_id": question["problem_id"],
-            "level": int(question["level"]),
-            "topic": question.get("topic"),
+            "question_sha256": question["question_sha256"],
         }
         for question_index, question in enumerate(questions, start=1)
     ]
@@ -346,6 +337,7 @@ def _update_run_manifest(
         "device": backend.device,
         "dtype": backend.dtype,
         "runtime": runtime_versions(),
+        "git_commit": git_commit(),
         "updated_at": utc_now(),
     })
     subsets = manifest.setdefault("subsets", {})
@@ -357,14 +349,14 @@ def run_generation(
     config: Mapping[str, Any], subset: str, *, resume: bool, backend_name: str,
     limit: int | None = None, mock_fixture: str | None = None, max_retries: int = 2,
 ) -> dict[str, Any]:
-    if subset not in {"pilot", "seed_train", "anchor"}:
+    if subset not in {"pilot", "seed_train"}:
         raise PipelineError(f"Unsupported generation subset: {subset}")
     ensure_directories(config)
     input_path, output_path = paths_for_subset(config, subset)
     # Split records are public by contract. Reject accidental leakage before a
     # backend sees any prompt.
     questions = list(read_jsonl(input_path))
-    forbidden = {"solution", "gold_answer", "source_solution"}
+    forbidden = {"answer", "gold_answer", "source_answer", "solution", "source_solution"}
     for question in questions:
         leaked = forbidden & set(question)
         if leaked:
@@ -381,6 +373,7 @@ def run_generation(
         questions = questions[:limit]
 
     selected_questions = pilot_selection_rows(questions) if subset == "pilot" else []
+    few_shot = load_few_shot(experiment_root(config) / "prompts" / "few_shot.jsonl")
 
     backend: Backend
     if backend_name == "mock":
@@ -394,10 +387,9 @@ def run_generation(
         write_json_atomic(experiment_root(config) / "reports" / "pilot_selection.json", {
             "created_at": utc_now(),
             "run_id": config["run_id"],
-            "source_subset": config["pilot"].get("source_subset", "dev"),
-            "selection_strategy": config["pilot"].get("selection_strategy", "id_order"),
+            "source_subset": "seed_train",
+            "selection_strategy": "seeded_random",
             "selection_seed": int(config["pilot"].get("selection_seed", config["master_seed"])),
-            "level_counts": config["pilot"].get("level_counts"),
             "limited": limit is not None,
             "selected_questions": selected_questions,
         })
@@ -426,10 +418,9 @@ def run_generation(
                     backend.set_task(str(question["problem_id"]), sample_index)
                 seed = stable_seed(config["master_seed"], config["run_id"], question["problem_id"], sample_index)
                 prompt_version = str(config["sampling"]["prompt_version"])
-                try:
-                    prompt = PROMPTS[prompt_version].format(problem=question["problem"])
-                except KeyError as exc:
-                    raise PipelineError(f"Unknown prompt_version: {prompt_version}") from exc
+                if prompt_version != PROMPT_VERSION:
+                    raise PipelineError(f"Unknown prompt_version: {prompt_version}")
+                prompt = build_prompt(str(question["question"]), few_shot)
                 started = time.perf_counter()
                 last_error: Exception | None = None
                 generated: dict[str, Any] | None = None
@@ -490,7 +481,7 @@ def run_generation(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--subset", required=True, choices=("pilot", "seed_train", "anchor"))
+    parser.add_argument("--subset", required=True, choices=("pilot", "seed_train"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--backend", choices=("transformers", "mock"), default="transformers")
