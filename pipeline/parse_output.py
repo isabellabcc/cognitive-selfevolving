@@ -1,4 +1,4 @@
-"""Parse GPT-J GSM8K completions without scanning arbitrary trailing numbers."""
+"""Parse GSM8K completions without scanning arbitrary trailing numbers."""
 
 from __future__ import annotations
 

@@ -97,16 +97,17 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise PipelineError("dataset.few_shot_indices must be unique non-negative integers")
     if len(few_shot_indices) + sum(int(dataset[field]) for field in ("validation_size", "generation_size")) >= 7473:
         raise PipelineError("Configured GSM8K train partitions leave no reserve examples")
-    if config["model"].get("id") != "EleutherAI/gpt-j-6b":
-        raise PipelineError("This reproduction requires EleutherAI/gpt-j-6b")
+    model_id = config["model"].get("id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise PipelineError("model.id must be a non-empty Hugging Face model ID or local path")
     if int(config["sampling"].get("batch_size", 0)) != 1:
         raise PipelineError("Experiment v1 requires sampling.batch_size=1")
     if config["sampling"].get("prompt_version") != "gsm8k_star_v1":
         raise PipelineError("sampling.prompt_version must be gsm8k_star_v1")
     if int(config["sampling"].get("n_per_problem", 0)) != 1:
-        raise PipelineError("The registered single-round experiment requires n_per_problem=1")
+        raise PipelineError("The registered single-trajectory experiment requires n_per_problem=1")
     if bool(config["sampling"].get("do_sample", True)):
-        raise PipelineError("The registered GPT-J STaR generation must use greedy decoding")
+        raise PipelineError("The registered single-trajectory experiment must use greedy decoding")
     pilot = config["pilot"]
     try:
         pilot_count = int(pilot.get("n_problems", 0))

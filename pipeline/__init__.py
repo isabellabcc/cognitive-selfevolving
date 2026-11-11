@@ -1,3 +1,3 @@
-"""Single-round STaR reproduction on GSM8K with GPT-J 6B."""
+"""Single-round outcome-filtered self-training experiments on GSM8K."""
 
 __version__ = "1.0.0"

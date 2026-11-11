@@ -1,4 +1,4 @@
-"""Generate GPT-J GSM8K rationales with deterministic resume support."""
+"""Generate causal-LM GSM8K rationales with deterministic resume support."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ RAW_REQUIRED_FIELDS = {
 
 
 def gsm8k_stopping_criteria(tokenizer: Any, prompt_length: int) -> Any:
-    """Stop after a complete `#### answer` line instead of waiting for GPT-J EOS."""
+    """Stop after a complete `#### answer` line instead of waiting for model EOS."""
     try:
         from transformers import StoppingCriteria, StoppingCriteriaList
     except ImportError as exc:

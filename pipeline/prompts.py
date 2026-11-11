@@ -1,4 +1,4 @@
-"""Plain-text GSM8K prompts matching GPT-J's causal completion interface."""
+"""Plain-text GSM8K prompts for causal language-model completion."""
 
 from __future__ import annotations
 
