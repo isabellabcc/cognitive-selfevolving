@@ -1,0 +1,62 @@
+project: star_gsm8k_single_trajectory_selection
+run_id: gsm8k_qwen25_1p5b_r0
+master_seed: 42
+
+dataset:
+  repo_id: openai/gsm8k
+  config_name: main
+  revision: main
+  split_seed: 42
+  # Four examples appearing in the STaR paper's GSM8K prompt appendix.
+  few_shot_indices: [0, 2, 3, 5]
+  validation_size: 300
+  generation_size: 4000
+
+model:
+  id: Qwen/Qwen2.5-1.5B
+  revision: main
+  adapter_path: null
+  device: auto
+  torch_dtype: float16
+  # Download/prefetch the model first, then keep the registered run offline.
+  local_files_only: true
+
+sampling:
+  prompt_version: gsm8k_star_v1
+  n_per_problem: 1
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 384
+  batch_size: 1
+
+pilot:
+  n_problems: 32
+  selection_seed: 42
+
+star:
+  round: 0
+  rationalization:
+    n_per_problem: 1
+    max_new_tokens: 384
+  training:
+    learning_rate: 0.0002
+    epochs: 2
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 8
+    max_seq_length: 1024
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    gradient_checkpointing: true
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+  evaluation:
+    max_new_tokens: 384
+    batch_size: 1
+
+paths:
+  root: data/gsm8k_qwen25_1p5b_r0
+  run_root: runs/gsm8k_qwen25_1p5b_r0
